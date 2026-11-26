@@ -1,0 +1,17 @@
+{
+  "name": "claude-mods",
+  "description": "Two Claude Code mods: a usage meter for plan limits and a live pane of running agents",
+  "owner": { "name": "mirfan899", "url": "https://github.com/mirfan899" },
+  "plugins": [
+    {
+      "name": "usage-meter",
+      "source": "./usage-meter",
+      "description": "A band above the prompt with the 5-hour and weekly plan limits, context fill and estimated cost; toasts at 80% and 95%"
+    },
+    {
+      "name": "swarm",
+      "source": "./swarm",
+      "description": "A live pane of the agents running in the session: who spawned whom, status, tokens and estimated cost"
+    }
+  ]
+}

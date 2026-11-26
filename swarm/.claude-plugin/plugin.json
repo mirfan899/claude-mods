@@ -1,0 +1,7 @@
+{
+  "name": "swarm",
+  "version": "0.1.0",
+  "description": "A live pane of the agents running in this session: who spawned whom, status, what each is doing, tokens and estimated cost.",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "usage-meter",
+  "version": "0.1.0",
+  "description": "A band above the prompt with the 5-hour and weekly plan limits, context fill and the session's estimated cost; toasts at 80% and 95%.",
+  "types": "./types/index.d.ts",
+  "license": "MIT"
+}
