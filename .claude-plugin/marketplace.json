@@ -1,7 +1,10 @@
 {
   "name": "claude-mods",
-  "description": "Two Claude Code mods: a usage meter for plan limits and a live pane of running agents",
-  "owner": { "name": "mirfan899", "url": "https://github.com/mirfan899" },
+  "description": "Claude Code mods: a plan-limit usage meter, and OneWave AI's swarm map of running agents",
+  "owner": {
+    "name": "mirfan899",
+    "url": "https://github.com/mirfan899"
+  },
   "plugins": [
     {
       "name": "usage-meter",
@@ -11,7 +14,7 @@
     {
       "name": "swarm",
       "source": "./swarm",
-      "description": "A live pane of the agents running in the session: who spawned whom, status, tokens and estimated cost"
+      "description": "Mission control for subagents and agent teams: who is running, what each is doing, who spawned whom (by OneWave AI, MIT)"
     }
   ]
 }

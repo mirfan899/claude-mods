@@ -1,187 +1,348 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import type { Row } from '../types'
+import type { Agent, Beat, Lead, Msg } from '../types'
+import { swarmSvg } from './card'
+import {
+  addBeat,
+  addMsg,
+  ago,
+  elapsed,
+  finish,
+  isFailed,
+  isLive,
+  labelOf,
+  MAIN,
+  nameOf,
+  reconcile,
+  resolve,
+  shortModel,
+  statusWord,
+  summary,
+  toolEnd,
+  toolStart,
+  tree,
+  upsert,
+} from './model'
 
 const PANE = 'swarm'
-const rows = atom({ plugin: 'swarm', key: 'rows' } as const, [])
+const TITLE = 'Swarm'
+const POLL_MS = 2000
 
-const SPARK = '▁▂▃▄▅▆▇█'
-const MAX_ROWS = 60
+const GOLD = '#c2a87e'
+const GOLD_HI = '#d4a44a'
+const BLUE = '#61A5FA'
+const RED = '#e5484d'
+const INK = '#0B1121'
 
-function spark(samples: number[]): string {
-  if (samples.length < 2) return ''
-  const top = Math.max(...samples)
-  const low = Math.min(...samples)
-  if (top === low) return '▁'.repeat(Math.min(samples.length, 8))
+const agentsAtom = atom({ plugin: 'swarm', key: 'agents' } as const, [] as Agent[])
+const leadAtom = atom({ plugin: 'swarm', key: 'lead' } as const, { busy: false, tools: 0, lastAt: 0, startedAt: 0 } as Lead)
+const msgsAtom = atom({ plugin: 'swarm', key: 'msgs' } as const, [] as Msg[])
+const beatsAtom = atom({ plugin: 'swarm', key: 'beats' } as const, [] as Beat[])
+const tickAtom = atom({ plugin: 'swarm', key: 'tick' } as const, 0)
 
-  return samples
-    .slice(-8)
-    .map(n => SPARK.charAt(Math.round(((n - low) / (top - low)) * (SPARK.length - 1))))
-    .join('')
+let lastStatus: string | undefined
+let wasLive = 0
+
+const beat = async ($: EngineInterface, who: string, kind: Beat['kind'], text: string) => {
+  const at = await $.clock.now()
+  await update($, beatsAtom, list => addBeat(list, { at, who, kind, text }))
 }
 
-function tokens(n: number): string {
-  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
-
-  return String(n)
-}
-
-function elapsed(ms: number): string {
-  const s = Math.max(0, Math.round(ms / 1000))
-  const m = Math.floor(s / 60)
-
-  return m >= 60
-    ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
-    : `${m}:${String(s % 60).padStart(2, '0')}`
-}
-
-function isLive(status: string): boolean {
-  return status === 'running' || status === 'waiting' || status === 'pending'
-}
-
-function mark(status: string): string {
-  if (status === 'running') return '●'
-  if (status === 'waiting' || status === 'pending') return '◌'
-  if (status === 'idle') return '○'
-  if (status === 'completed') return '✓'
-  return '✗'
-}
-
-function tone(status: string): string {
-  if (status === 'running') return 'yellow'
-  if (status === 'waiting' || status === 'pending' || status === 'idle') return 'cyan'
-  if (status === 'completed') return 'green'
-  return 'red'
-}
-
-// Parents before children, live agents before finished ones, newest first inside a level.
-function tree(all: Row[]): { row: Row; depth: number }[] {
-  const ids = new Set(all.map(r => r.id))
-  const kids = new Map<string, Row[]>()
-  const roots: Row[] = []
-  for (const r of all) {
-    if (r.parentId && ids.has(r.parentId)) {
-      kids.set(r.parentId, [...(kids.get(r.parentId) ?? []), r])
-    } else {
-      roots.push(r)
-    }
+/** "◇ swarm 3 live · 5 done" while anything has run this session. */
+const pushStatus = async ($: EngineInterface) => {
+  const agents = await read($, agentsAtom)
+  const now = await $.clock.now()
+  const s = summary(agents, now)
+  const text = agents.length
+    ? `◇ swarm ${s.live ? `${s.live} live · ` : ''}${s.done} done${s.failed ? ` · ${s.failed} failed` : ''}`
+    : undefined
+  if (s.live === 0 && wasLive > 0 && agents.length > 1) {
+    $.ui.toast(`Swarm stood down: ${agents.length} agents, ${s.tools} tool calls, ${s.first !== undefined && s.last !== undefined ? elapsed(s.last - s.first) : ''} wall. /swarm`, {
+      timeoutMs: 7000,
+    })
   }
-  const order = (a: Row, b: Row) =>
-    Number(isLive(b.status)) - Number(isLive(a.status)) || b.startTime - a.startTime
-  const out: { row: Row; depth: number }[] = []
-  const walk = (r: Row, depth: number) => {
-    out.push({ row: r, depth })
-    for (const k of (kids.get(r.id) ?? []).sort(order)) walk(k, depth + 1)
-  }
-  for (const r of roots.sort(order)) walk(r, 0)
+  wasLive = s.live
+  if (text === lastStatus) return
+  lastStatus = text
+  $.ui.status(text)
+}
 
-  return out
+/** One read of `$.agent.list()` folded into the tree; redraws only when something moved. */
+const poll = async ($: EngineInterface) => {
+  const now = await $.clock.now()
+  const listed = await $.agent.list().catch(() => [])
+  const prev = await read($, agentsAtom)
+  const { agents, finished } = reconcile(prev, listed, now)
+  if (JSON.stringify(agents) !== JSON.stringify(prev)) await update($, agentsAtom, () => agents)
+  for (const a of finished) await beat($, a.name || a.label, isFailed(a.status) ? 'fail' : 'done', `${statusWord(a.status)} in ${elapsed(now - a.startedAt)}, ${a.tools} tool calls`)
+  if (agents.some(a => isLive(a.status))) await update($, tickAtom, n => n + 1)
+  await pushStatus($)
 }
 
 export const register: Register = on => {
-  let lastKey = ''
-  let cancel: (() => void) | undefined
-
   on('session.start', async ($, e, next) => {
-    await $.command.register({
-      name: 'swarm',
-      description: 'Open the live pane of the agents running in this session',
-    })
-    cancel?.()
-    const refresh = async () => {
-      const list = await $.agent.list()
-      const fresh: Row[] = list.map(a => ({
-        id: a.id,
-        parentId: a.parentId,
-        name: a.name ?? a.type,
-        type: a.type,
-        status: a.status,
-        label: (a.label.split('\n')[0] ?? '').trim(),
-        startTime: a.startTime,
-        tokens: a.tokenCount,
-        samples: a.tokenSamples,
-        usd: a.cost?.usd ?? null,
-      }))
-      // Only a change redraws the pane: the clock moves every second, the list does not.
-      const key = JSON.stringify(fresh.map(r => [r.id, r.status, r.label, r.tokens, r.usd]))
-      if (key !== lastKey) {
-        lastKey = key
-        await update($, rows, () => fresh)
-      }
-    }
-    const timer = $.clock.every(2000, refresh)
-    cancel = () => timer.cancel()
-    await refresh()
-
-    return next(e)
-  })
-
-  on('session.end', async ($, e, next) => {
-    cancel?.()
-    cancel = undefined
-
+    await $.command.register({ name: 'swarm', description: 'Swarm: live map of subagents and agent teams, who is doing what, who spawned whom, who is talking' })
+    const now = await $.clock.now()
+    await update($, leadAtom, l => (l.startedAt ? l : { ...l, startedAt: now, lastAt: now }))
+    $.clock.every(POLL_MS, () => void poll($).catch(() => undefined))
     return next(e)
   })
 
   on('command.run', { command: 'swarm' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'Swarm' })
+    await $.ui.open({ id: PANE, title: TITLE })
+    await poll($).catch(() => undefined)
+    const agents = await read($, agentsAtom)
+    const s = summary(agents, await $.clock.now())
+    return { text: agents.length ? `Swarm open: ${s.live} live, ${s.done} done, ${s.failed} failed.` : 'Swarm open. No agents yet this session.' }
+  })
 
-    return { text: 'Swarm pane opened.' }
+  // A spawn: who launched it, what it runs as, on which model.
+  on('agent.spawn', async ($, e, next) => {
+    const r = await next(e)
+    const now = await $.clock.now()
+    if (r.deny !== undefined) {
+      await beat($, e.name || e.description, 'deny', `spawn refused: ${r.deny}`)
+      return r
+    }
+    if (r.agentId) {
+      const id = r.agentId
+      await update($, agentsAtom, list =>
+        upsert(list, id, now, {
+          label: e.description,
+          type: e.fork ? 'fork' : e.subagentType,
+          ...(e.name ? { name: e.name } : {}),
+          ...(e.parentAgentId ? { parentId: e.parentAgentId } : {}),
+          model: r.model,
+          bg: e.background,
+          toolUseId: e.tool_use_id,
+          status: 'running',
+          startedAt: now,
+        }),
+      )
+      const agents = await read($, agentsAtom)
+      const by = e.parentAgentId ? nameOf(agents, e.parentAgentId) : 'lead'
+      await beat($, e.name || e.description, 'spawn', `spawned by ${by} as ${e.fork ? 'fork' : e.subagentType}${r.model ? ` on ${shortModel(r.model)}` : ''}`)
+      await pushStatus($)
+    }
+    return r
+  })
+
+  // Every tool call, in whichever loop: what each agent is doing right now.
+  on('tool.call', async ($, e, next) => {
+    const input = e as unknown as Record<string, unknown>
+    const who = e.agentId
+    const now = await $.clock.now()
+    const doing = labelOf(e.tool, input)
+    if (who) await update($, agentsAtom, list => toolStart(list, who, e.tool, doing, now))
+    else await update($, leadAtom, l => ({ ...l, doing, doingTool: e.tool, busy: true, tools: l.tools + 1, lastAt: now }))
+    let ok = false
+    try {
+      const ran = await next(e)
+      ok = ran.deny === undefined && ran.isError !== true
+      return ran
+    } finally {
+      const end = await $.clock.now()
+      if (who) {
+        await update($, agentsAtom, list => toolEnd(list, who, ok, end))
+        if (!ok) {
+          const agents = await read($, agentsAtom)
+          await beat($, nameOf(agents, who), 'fail', `${doing} failed`)
+        }
+      } else await update($, leadAtom, l => ({ ...l, busy: false, lastAt: end }))
+      // A foreground Agent call returning means that agent is finished.
+      if (e.tool === 'Agent') {
+        const agents = await read($, agentsAtom)
+        const a = agents.find(x => x.toolUseId === e.tool_use_id)
+        if (a && !a.bg && isLive(a.status)) {
+          await update($, agentsAtom, list => finish(list, a.id, ok ? 'completed' : 'failed', end))
+          await beat($, a.name || a.label, ok ? 'done' : 'fail', `${ok ? 'done' : 'failed'} in ${elapsed(end - a.startedAt)}, ${a.tools} tool calls`)
+          await pushStatus($)
+        }
+      }
+    }
+  })
+
+  // Messages between agents, as they leave.
+  on('session.send', async ($, e, next) => {
+    const r = await next(e)
+    if (r.isDelivered) {
+      const at = await $.clock.now()
+      const agents = await read($, agentsAtom)
+      const from = e.agentId ?? MAIN
+      const to = resolve(agents, e.to)
+      await update($, msgsAtom, list => addMsg(list, { at, from, to, text: e.text }))
+      await beat($, nameOf(agents, from), 'msg', `→ ${nameOf(agents, to)}: ${e.text.replace(/\s+/g, ' ')}`)
+    }
+    return r
+  })
+
+  // Teammates in their own panes write to the team inbox; this process never saw them send.
+  on('session.receive', async ($, e, next) => {
+    const r = await next(e)
+    const o = e.origin as { teammate?: string; isVerified?: boolean }
+    if (typeof o.teammate === 'string' && o.isVerified === false) {
+      const at = await $.clock.now()
+      const agents = await read($, agentsAtom)
+      const from = resolve(agents, o.teammate)
+      const to = e.agentId ?? MAIN
+      await update($, msgsAtom, list => addMsg(list, { at, from, to, text: e.text }))
+      await beat($, o.teammate, 'msg', `→ ${nameOf(agents, to)}: ${e.text.replace(/\s+/g, ' ')}`)
+    }
+    return r
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const id = e.agentId
+    const out = e.usage?.output_tokens ?? 0
+    if (id && out) {
+      const now = await $.clock.now()
+      await update($, agentsAtom, list => {
+        const a = list.find(x => x.id === id)
+        return a ? upsert(list, id, now, { outTokens: a.outTokens + out }) : list
+      })
+    }
+    if (!id) await update($, leadAtom, l => ({ ...l, busy: false, doing: undefined }))
+    return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
-    const all = await read($, rows)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    await read($, tickAtom)
     const now = await $.clock.now()
-    const cols = e.viewport?.columns ?? 80
-    const room = Math.max(1, (e.viewport?.rows ?? 24) - 5)
+    const agents = await read($, agentsAtom)
+    const lead = await read($, leadAtom)
+    const msgs = await read($, msgsAtom)
+    const beats = await read($, beatsAtom)
+    const clear = () => {
+      void (async () => {
+        const live = (await read($, agentsAtom)).filter(a => isLive(a.status))
+        await update($, agentsAtom, () => live)
+        await update($, msgsAtom, () => [])
+        await update($, beatsAtom, () => [])
+        await pushStatus($)
+      })()
+    }
+    const controls = (
+      <Box key="controls" gap={2} flexWrap="wrap">
+        <Button key="refresh" label="refresh" hotkey="r" onPress={() => void poll($).catch(() => undefined)} />
+        <Button key="clear" label="clear finished" hotkey="c" onPress={clear} />
+      </Box>
+    )
+    const s = summary(agents, now)
 
-    const live = all.filter(r => isLive(r.status)).length
-    const usd = all.reduce((n, r) => n + (r.usd ?? 0), 0)
-    const total = all.reduce((n, r) => n + r.tokens, 0)
-
-    if (all.length === 0) {
+    if (e.surface !== 'terminal') {
+      const { Svg } = $.ui.resolve(e)
+      const card = swarmSvg({ now, agents, lead, msgs, beats })
+      const alt = `Swarm: ${s.live} live, ${s.done} done, ${s.failed} failed agents. ${tree(agents)
+        .slice(0, 8)
+        .map(r => `${r.agent.name || r.agent.label} (${statusWord(r.agent.status)}${r.agent.doing ? `, ${r.agent.doing}` : ''})`)
+        .join('; ')}`
       return (
-        <Box flexDirection="column">
-          <Text dimColor>No agents in this session yet.</Text>
+        <Box flexDirection="column" gap={1}>
+          <Svg key="swarm" source={card.source} alt={alt} width={card.width} height={card.height} />
+          {controls}
         </Box>
       )
     }
 
-    const shown = tree(all).slice(0, Math.min(MAX_ROWS, room))
-    const labelWidth = Math.max(16, cols - 52)
+    // Terminal: the same tree in cells.
+    const width = Math.max(36, (e.props.bodyColumns || 60) - 2)
+    const rows = tree(agents)
+    const glyph = (a: Agent) => (isLive(a.status) ? (a.busy ? '●' : '◉') : isFailed(a.status) ? '×' : '✓')
+    const tone = (a: Agent) => (isLive(a.status) ? BLUE : isFailed(a.status) ? RED : GOLD)
+    const t0 = s.first ?? now
+    const span = Math.max(1000, now - t0)
+    const laneW = Math.max(10, Math.min(40, width - 18))
+    const lane = (a: Agent) => {
+      const x1 = Math.floor(((a.startedAt - t0) / span) * laneW)
+      const x2 = Math.max(x1 + 1, Math.ceil((((a.endedAt ?? now) - t0) / span) * laneW))
+      return ' '.repeat(x1) + '━'.repeat(Math.min(laneW, x2) - x1) + ' '.repeat(Math.max(0, laneW - Math.min(laneW, x2)))
+    }
 
     return (
-      <Box flexDirection="column">
-        <Text>
-          <Text bold>{live} running</Text>
-          <Text dimColor>
-            {' '}
-            · {all.length - live} finished · {tokens(total)} tokens
-            {usd > 0 ? ` · est $${usd.toFixed(2)}` : ''}
+      <Box flexDirection="column" paddingX={1} gap={1}>
+        <Box justifyContent="space-between">
+          <Text>
+            <Text bold color={GOLD}>SWARM</Text>
+            <Text dimColor>{`  ${agents.length} agents · ${s.tools + lead.tools} tool calls · peak ${s.peak} parallel`}</Text>
           </Text>
-        </Text>
-        {shown.map(({ row, depth }) => {
-          const label = row.label.length > labelWidth ? `${row.label.slice(0, labelWidth - 1)}…` : row.label
-          const stat = isLive(row.status) ? elapsed(now - row.startTime) : row.status
+          {s.live ? <Text backgroundColor={BLUE} color={INK} bold>{` ${s.live} LIVE `}</Text> : <Text dimColor>{agents.length ? 'STOOD DOWN' : 'IDLE'}</Text>}
+        </Box>
 
-          return (
-            <Text key={row.id}>
-              {'  '.repeat(depth)}
-              <Text color={tone(row.status)}>{mark(row.status)} </Text>
-              <Text bold>{row.name} </Text>
-              <Text dimColor>
-                {label} · {stat} · {tokens(row.tokens)} {spark(row.samples)}
-                {row.usd !== null && row.usd > 0 ? ` · $${row.usd.toFixed(2)}` : ''}
+        <Box flexDirection="column">
+          <Text dimColor bold>ORCHESTRATION</Text>
+          <Text>
+            <Text color={GOLD_HI}>◆ </Text>
+            <Text bold>Lead</Text>
+            <Text color={lead.busy ? BLUE : undefined} dimColor={!lead.busy}>{`  ${(lead.doing ?? 'waiting for you').slice(0, width - 12)}`}</Text>
+          </Text>
+          {rows.length === 0 && <Text dimColor>  No agents yet. Spawn subagents or a team and they appear here live.</Text>}
+          {rows.slice(0, 20).map(r => {
+            const a = r.agent
+            const prefix = r.trail.map(t => (t ? '│ ' : '  ')).join('') + (r.last ? '└─' : '├─')
+            const nm = a.name || a.label
+            const right = isLive(a.status) ? elapsed(now - a.startedAt) : statusWord(a.status)
+            const doing = a.doing ?? (isLive(a.status) ? 'thinking' : '')
+            const room = Math.max(8, width - prefix.length - nm.length - right.length - 8)
+            return (
+              <Box key={a.id} justifyContent="space-between">
+                <Text>
+                  <Text dimColor>{prefix}</Text>
+                  <Text color={tone(a)}>{` ${glyph(a)} `}</Text>
+                  <Text bold>{nm.slice(0, 24)}</Text>
+                  <Text dimColor>{` ${a.type === 'general-purpose' ? 'general' : a.type}`}</Text>
+                  <Text color={isLive(a.status) && a.busy ? BLUE : undefined} dimColor={!(isLive(a.status) && a.busy)}>{`  ${doing.slice(0, room)}`}</Text>
+                </Text>
+                <Text color={tone(a)}>{`${a.tools}× ${right}`}</Text>
+              </Box>
+            )
+          })}
+        </Box>
+
+        {rows.length > 0 && (
+          <Box flexDirection="column">
+            <Text dimColor bold>TIMELINE</Text>
+            {rows.slice(0, 12).map(r => (
+              <Text key={r.agent.id}>
+                <Text dimColor>{(r.agent.name || r.agent.label).slice(0, 12).padEnd(13)}</Text>
+                <Text color={tone(r.agent)}>{lane(r.agent)}</Text>
               </Text>
-            </Text>
-          )
-        })}
-        {all.length > shown.length ? (
-          <Text dimColor>+{all.length - shown.length} more</Text>
-        ) : null}
+            ))}
+          </Box>
+        )}
+
+        {msgs.length > 0 && (
+          <Box flexDirection="column">
+            <Text dimColor bold>{`COMMS  ${msgs.length}`}</Text>
+            {msgs
+              .slice(-4)
+              .reverse()
+              .map((m, i) => (
+                <Text key={`m${i}`}>
+                  <Text color={GOLD_HI} bold>{`${nameOf(agents, m.from)} → ${nameOf(agents, m.to)}`}</Text>
+                  <Text dimColor>{`  ${m.text.replace(/\s+/g, ' ').slice(0, Math.max(10, width - 30))}  ${ago(now - m.at)}`}</Text>
+                </Text>
+              ))}
+          </Box>
+        )}
+
+        {beats.length > 0 && (
+          <Box flexDirection="column">
+            <Text dimColor bold>ACTIVITY</Text>
+            {beats
+              .slice(-6)
+              .reverse()
+              .map((b, i) => (
+                <Text key={`b${i}`}>
+                  <Text color={b.kind === 'fail' || b.kind === 'deny' ? RED : b.kind === 'spawn' ? BLUE : b.kind === 'msg' ? GOLD_HI : GOLD}>{'▍'}</Text>
+                  <Text bold>{` ${b.who.slice(0, 18)}`}</Text>
+                  <Text dimColor>{` ${b.text.slice(0, Math.max(10, width - b.who.length - 10))}  ${ago(now - b.at)}`}</Text>
+                </Text>
+              ))}
+          </Box>
+        )}
+        {controls}
       </Box>
     )
   })
