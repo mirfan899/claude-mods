@@ -1,11 +1,16 @@
 {
   "name": "claude-mods",
-  "description": "Claude Code mods: a plan-limit usage meter, and OneWave AI's swarm map of running agents",
+  "description": "Claude Code mods: a Deck-style usage meter, and OneWave AI's swarm map of running agents",
   "owner": {
     "name": "mirfan899",
     "url": "https://github.com/mirfan899"
   },
   "plugins": [
+    {
+      "name": "burn-meter",
+      "source": "./burn-meter",
+      "description": "Usage meter in Deck's style: Context, Session, Weekly and per-model usage beside the fuse; no cost (a modified OneWave AI burn-meter, MIT)"
+    },
     {
       "name": "usage-meter",
       "source": "./usage-meter",

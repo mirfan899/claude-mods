@@ -1,0 +1,16 @@
+{
+  "name": "burn-meter",
+  "version": "0.2.0",
+  "description": "Usage meter above the prompt in Deck's style: Context, Session, Weekly and per-model usage beside OneWave AI's fuse. No cost shown.",
+  "types": "./types/index.d.ts",
+  "license": "MIT",
+  "author": {
+    "name": "mirfan899",
+    "url": "https://github.com/mirfan899"
+  },
+  "homepage": "https://github.com/mirfan899/claude-mods/tree/main/burn-meter",
+  "repository": "https://github.com/mirfan899/claude-mods",
+  "displayName": "Burn Meter (Deck style)",
+  "icon": "./.claude-plugin/icon.png",
+  "documentationUrl": "https://github.com/mirfan899/claude-mods/blob/main/burn-meter/README.md"
+}
